@@ -1,0 +1,3 @@
+<button form="search-form" 
+        formaction="btoa(document.cookie)">
+</button>
