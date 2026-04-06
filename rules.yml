@@ -1,0 +1,32 @@
+# rules.yaml
+
+name: "advanced-xss"
+description: "Targeted XSS with specific parameter overrides"
+vars:
+  xss-payloads: "<button form='search-form' formaction='javascript:alert(1)'>Click</button>"
+  other-value: "lolo"
+# Specific parameter targets
+actions:
+  - duplicate: true #duplicate is false by default if true the flow will be copied the all the folowin instructions will be aplied on the duplicated flow 
+    replace_params:
+      fallback_payload: "<script>alert('global')</script>"
+      params1: xss-payloads
+      user_id: other-values # Sometimes we want to keep some params valid
+    add_params:
+      new_key: other-value
+      #...
+    replay_search:
+      value: xss-payloads # all values should be looked in vars we can on vars  like the previous example `xss-payloads` or an aray of var [xss-payloads other]
+      in: "body" # body | header
+      found_mark: ":syringe:"
+    only: "8a2A2..." # this action will only aplied on the flow
+    exclude_ids: ["9a2b1..."] # if only is set we will ignore it
+
+
+  # target:
+  #     # Only run this rule on these flow IDs
+  #     include_ids: ["5b8e9...", "12cde..."]
+  #     # OR exclude specific flows (e.g., logout endpoints)
+  #     exclude_ids: ["9a2b1..."]
+  #     # Filter by URL regex
+  #     url_match: ".*api/v1/search.*"
