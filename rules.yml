@@ -1,8 +1,13 @@
 # ============================================================
 # flow.actions — Example Rule File
 # ============================================================
-# Usage:  flow.actions @all ./rules.yml
-#         flow.actions @focus ./rules.yml
+# Manual usage:
+#   flow.actions @all ./rules.yml
+#   flow.actions @focus ./rules.yml
+#
+# Auto-watch (applies to matching incoming flows):
+#   flow.actions.watch "~u example.com" ./rules.yml
+#   flow.actions.stop
 # ============================================================
 
 name: "advanced-xss"
@@ -30,7 +35,9 @@ vars:
 #   2. duplicate (copy flow if true)
 #   3. replace_params (modify existing params)
 #   4. add_params (inject new params)
-#   5. replay_search (replay + verify) — always last
+#   5. replay (replay the request)           — after all param actions
+#   6. search (search the response)          — after replay
+#   7. find_important_headers_cookies        — terminal (does its own replays)
 # ----------------------------------------------------------
 action-groups:
 
@@ -52,7 +59,11 @@ action-groups:
     add_params:
       new_key: { var: payload_a }
 
-    replay_search:
+    # Replay the modified request
+    replay: true
+
+    # Search the response for our payload (no replay — already done above)
+    search:
       # What to search for in the response
       # Can be:  "literal string"
       #          { var: single_name }
@@ -74,8 +85,18 @@ action-groups:
     # only_ids: ["8a2A2..."]       # ONLY run on these flow IDs
     # exclude_ids: ["9a2b1..."]    # Skip these flow IDs
 
-  # --- Group 2: In-place modification (no duplicate) -------
+  # --- Group 2: Find important headers & cookies -----------
+  # Uncomment to identify which headers/cookies are essential
+  # for the request to succeed. Each one is removed individually,
+  # the request is replayed, and the response is compared.
+  #
+  # - find_important_headers_cookies:
+  #     scope: "both"                     # "headers" | "cookies" | "both"
+  #     output: "./important_results.json" # optional, logs if omitted
+
+  # --- Group 3: In-place modification (no duplicate) -------
   # - duplicate: false
   #   replace_params:
   #     auth_token: "expired_jwt"
   #     session_id: "invalid"
+  #   replay: true

@@ -5,6 +5,9 @@ Usage:
     flow.actions @all ./rules.yaml
     flow.actions @focus ./rules.yaml
 
+    flow.actions.watch "~u example.com" ./rules.yaml   # auto-apply on matching flows
+    flow.actions.stop                                   # stop watching
+
 YAML schema:
     name: "rule-name"
     description: "..."
@@ -21,15 +24,20 @@ YAML schema:
           user_id: "literal_string"
         add_params:
           new_key: { var: payload_a }
-        replay_search:
+        replay: true
+        search:
           value: { var: [payload_a, canary] }
           condition: "OR"
           in: "body"
           found_mark: ":syringe:"
+        find_important_headers_cookies:
+          scope: "both"          # "headers" | "cookies" | "both"
+          output: "./important_headers_cookies.json"
         only_ids: ["..."]
         exclude_ids: ["..."]
 """
 
+import json
 import logging
 import uuid
 import asyncio
@@ -45,21 +53,34 @@ from mitmproxy.addons.clientplayback import ReplayHandler
 
 # ---------------------------------------------------------------------------
 # Execution order for actions within a group.
-# replay_search is intentionally excluded — it always runs last.
+# replay is now a standalone action, search runs after replay,
+# find_important_headers_cookies is a terminal action.
 # ---------------------------------------------------------------------------
 ORDERED_ACTIONS = [
     "replace_params",
     "add_params",
 ]
 
-# Keys that are NOT actions (metadata / filter keys on the action-group dict)
-META_KEYS = {"duplicate", "only_ids", "exclude_ids", "replay_search", *ORDERED_ACTIONS}
+# Terminal actions that run after ORDERED_ACTIONS + replay, in this order:
+TERMINAL_ACTIONS = ["search", "find_important_headers_cookies"]
+
+# Keys that are NOT regular actions (metadata / filter / terminal keys)
+META_KEYS = {
+    "duplicate", "only_ids", "exclude_ids",
+    "replay", "search", "find_important_headers_cookies",
+    *ORDERED_ACTIONS,
+}
 
 
 class FlowActions:
     """mitmproxy addon: applies YAML-defined action-groups to selected flows."""
 
     FAIL_MARKER = ":x:"
+
+    def __init__(self):
+        self._watch_filter: str | None = None
+        self._watch_config: dict | None = None
+        self._watch_active: bool = False
 
     # ------------------------------------------------------------------
     # Variable resolver
@@ -253,16 +274,40 @@ class FlowActions:
                 target.request.query = query
 
     # ------------------------------------------------------------------
-    # Action: replay_search (async — always last)
+    # Action: replay (standalone replay, no search)
     # ------------------------------------------------------------------
-    async def _action_replay_search(
+    async def _action_replay(
+        self,
+        target: http.HTTPFlow,
+    ) -> None:
+        """
+        Replay the flow request. This is a standalone action that just
+        replays and waits for the response. Search can run after.
+        """
+        try:
+            handler = ReplayHandler(target, ctx.options)
+            await handler.replay()
+            logging.info(
+                f"[flow.actions] Replayed flow {target.id} — "
+                f"status {target.response.status_code if target.response else 'N/A'}"
+            )
+        except Exception as e:
+            logging.error(f"[flow.actions] Replay error for flow {target.id}: {e}")
+            target.marked = self.FAIL_MARKER
+            target.comment = f"[flow.actions] Replay error: {e}"
+            raise  # Propagate so callers can abort
+
+    # ------------------------------------------------------------------
+    # Action: search (post-replay response search)
+    # ------------------------------------------------------------------
+    def _action_search(
         self,
         target: http.HTTPFlow,
         config: dict,
         vars_dict: dict[str, str],
     ) -> None:
         """
-        Replay the flow and search the response for specific strings.
+        Search the response for specific strings. Runs AFTER replay.
 
         Config:
             value: <var-ref, literal, or array-ref>
@@ -275,62 +320,225 @@ class FlowActions:
         search_in = config.get("in", "body").lower()
         found_mark = config.get("found_mark", ":syringe:")
 
-        try:
-            handler = ReplayHandler(target, ctx.options)
-            await handler.replay()
+        # Determine where to search
+        haystack = b""
+        if search_in == "body":
+            if target.response and target.response.content:
+                haystack = target.response.content
+        elif search_in == "header":
+            if target.response:
+                haystack = b"\r\n".join(
+                    f"{k}: {v}".encode()
+                    for k, v in target.response.headers.items()
+                )
 
-            # Determine where to search
-            haystack = b""
-            if search_in == "body":
-                if target.response and target.response.content:
-                    haystack = target.response.content
-            elif search_in == "header":
-                if target.response:
-                    # Concatenate all header values
-                    haystack = b"\r\n".join(
-                        f"{k}: {v}".encode()
-                        for k, v in target.response.headers.items()
-                    )
+        # Check matches
+        results = [sv.encode() in haystack for sv in search_values]
 
-            # Check matches
-            results = [
-                sv.encode() in haystack for sv in search_values
+        if condition == "AND":
+            matched = all(results) and len(results) > 0
+        else:  # OR (default)
+            matched = any(results)
+
+        if matched:
+            target.marked = found_mark
+            target.comment = (
+                f"[flow.actions] Match found ({condition}: "
+                f"{', '.join(repr(v) for v in search_values)})"
+            )
+            logging.log(
+                ALERT,
+                f"[flow.actions] ✓ Match in flow {target.id} "
+                f"({condition}: {search_values})",
+            )
+        else:
+            target.marked = self.FAIL_MARKER
+            target.comment = (
+                f"[flow.actions] No match ({condition}: "
+                f"{', '.join(repr(v) for v in search_values)})"
+            )
+            logging.info(
+                f"[flow.actions] ✗ No match in flow {target.id} "
+                f"({condition}: {search_values})",
+            )
+
+    # ------------------------------------------------------------------
+    # Action: find_important_headers_cookies
+    # ------------------------------------------------------------------
+    async def _action_find_important_headers_cookies(
+        self,
+        target: http.HTTPFlow,
+        config: dict,
+        vars_dict: dict[str, str],
+    ) -> None:
+        """
+        Identify which headers and cookies are essential for the request.
+
+        For each header/cookie:
+          1. Copy the flow
+          2. Remove that single header or cookie
+          3. Replay the request
+          4. Compare response status & body to the original
+          5. If different → the header/cookie is important
+
+        Config:
+            scope: "headers" | "cookies" | "both" (default: "both")
+            output: "./important_results.json"  (optional, logs if omitted)
+        """
+        scope = config.get("scope", "both").lower()
+        output_path = config.get("output")
+
+        # We need a baseline response — replay the original first if needed
+        if target.response is None:
+            try:
+                await self._action_replay(target)
+            except Exception:
+                return
+
+        if target.response is None:
+            logging.error(
+                f"[flow.actions] Cannot find important headers/cookies: "
+                f"no response for flow {target.id}"
+            )
+            return
+
+        baseline_status = target.response.status_code
+        baseline_body = target.response.content or b""
+
+        important_headers: list[str] = []
+        important_cookies: list[str] = []
+        unimportant_headers: list[str] = []
+        unimportant_cookies: list[str] = []
+
+        # --- Check headers ---
+        if scope in ("headers", "both"):
+            # Collect all request headers (skip pseudo-headers and host)
+            skip_headers = {"host", "content-length", "transfer-encoding"}
+            headers_to_test = [
+                (k, v) for k, v in target.request.headers.items()
+                if k.lower() not in skip_headers
             ]
 
-            if condition == "AND":
-                matched = all(results) and len(results) > 0
-            else:  # OR (default)
-                matched = any(results)
+            for header_name, header_value in headers_to_test:
+                probe = self._duplicate_flow(target)
+                # Remove this specific header
+                if header_name in probe.request.headers:
+                    del probe.request.headers[header_name]
 
-            if matched:
-                target.marked = found_mark
-                target.comment = (
-                    f"[flow.actions] Match found ({condition}: "
-                    f"{', '.join(repr(v) for v in search_values)})"
-                )
+                try:
+                    handler = ReplayHandler(probe, ctx.options)
+                    await handler.replay()
+                except Exception as e:
+                    logging.warning(
+                        f"[flow.actions] Replay failed without header "
+                        f"'{header_name}': {e}"
+                    )
+                    important_headers.append(header_name)
+                    continue
+
+                probe_status = probe.response.status_code if probe.response else None
+                probe_body = (probe.response.content or b"") if probe.response else b""
+
+                if probe_status != baseline_status or probe_body != baseline_body:
+                    important_headers.append(header_name)
+                    logging.info(
+                        f"[flow.actions] ★ Header '{header_name}' is IMPORTANT "
+                        f"(status: {baseline_status}→{probe_status})"
+                    )
+                else:
+                    unimportant_headers.append(header_name)
+                    logging.info(
+                        f"[flow.actions] · Header '{header_name}' is not important"
+                    )
+
+        # --- Check cookies ---
+        if scope in ("cookies", "both"):
+            cookie_header = target.request.headers.get("cookie", "")
+            cookies = {}
+            if cookie_header:
+                for part in cookie_header.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        cookies[k.strip()] = v.strip()
+
+            for cookie_name in list(cookies.keys()):
+                probe = self._duplicate_flow(target)
+                # Rebuild cookie header without this cookie
+                remaining = {
+                    k: v for k, v in cookies.items() if k != cookie_name
+                }
+                if remaining:
+                    probe.request.headers["cookie"] = "; ".join(
+                        f"{k}={v}" for k, v in remaining.items()
+                    )
+                else:
+                    if "cookie" in probe.request.headers:
+                        del probe.request.headers["cookie"]
+
+                try:
+                    handler = ReplayHandler(probe, ctx.options)
+                    await handler.replay()
+                except Exception as e:
+                    logging.warning(
+                        f"[flow.actions] Replay failed without cookie "
+                        f"'{cookie_name}': {e}"
+                    )
+                    important_cookies.append(cookie_name)
+                    continue
+
+                probe_status = probe.response.status_code if probe.response else None
+                probe_body = (probe.response.content or b"") if probe.response else b""
+
+                if probe_status != baseline_status or probe_body != baseline_body:
+                    important_cookies.append(cookie_name)
+                    logging.info(
+                        f"[flow.actions] ★ Cookie '{cookie_name}' is IMPORTANT "
+                        f"(status: {baseline_status}→{probe_status})"
+                    )
+                else:
+                    unimportant_cookies.append(cookie_name)
+                    logging.info(
+                        f"[flow.actions] · Cookie '{cookie_name}' is not important"
+                    )
+
+        # --- Build results ---
+        results = {
+            "flow_id": target.id,
+            "url": target.request.pretty_url,
+            "baseline_status": baseline_status,
+            "important_headers": important_headers,
+            "unimportant_headers": unimportant_headers,
+            "important_cookies": important_cookies,
+            "unimportant_cookies": unimportant_cookies,
+        }
+
+        # --- Output ---
+        summary = (
+            f"[flow.actions] Important headers/cookies for {target.request.pretty_url}:\n"
+            f"  Headers: {important_headers or '(none)'}\n"
+            f"  Cookies: {important_cookies or '(none)'}"
+        )
+        logging.log(ALERT, summary)
+
+        target.comment = (
+            f"[flow.actions] Important — "
+            f"H: {important_headers}, C: {important_cookies}"
+        )
+
+        if output_path:
+            try:
+                with open(output_path, "w") as f:
+                    json.dump(results, f, indent=2)
                 logging.log(
                     ALERT,
-                    f"[flow.actions] ✓ Match in flow {target.id} "
-                    f"({condition}: {search_values})",
+                    f"[flow.actions] Results saved to {output_path}",
                 )
-            else:
-                target.marked = self.FAIL_MARKER
-                target.comment = (
-                    f"[flow.actions] No match ({condition}: "
-                    f"{', '.join(repr(v) for v in search_values)})"
+            except Exception as e:
+                logging.error(
+                    f"[flow.actions] Failed to write results to "
+                    f"{output_path}: {e}"
                 )
-                logging.info(
-                    f"[flow.actions] ✗ No match in flow {target.id} "
-                    f"({condition}: {search_values})",
-                )
-
-        except Exception as e:
-            logging.error(f"[flow.actions] Replay error for flow {target.id}: {e}")
-            target.marked = self.FAIL_MARKER
-            target.comment = f"[flow.actions] Replay error: {e}"
-
-        # Push updated flow to the UI
-        ctx.master.addons.trigger(hooks.UpdateHook([target]))
 
     # ------------------------------------------------------------------
     # Action registry
@@ -340,7 +548,8 @@ class FlowActions:
         registry = {
             "replace_params": self._action_replace_params,
             "add_params": self._action_add_params,
-            # replay_search is handled separately (async, always last)
+            # replay, search, and find_important_headers_cookies
+            # are handled separately in the pipeline
         }
         return registry.get(action_name)
 
@@ -395,11 +604,27 @@ class FlowActions:
         # Show the modified flow in the UI before replay
         ctx.master.addons.trigger(hooks.UpdateHook([target]))
 
-        # 4. Terminal action: replay_search (always last)
-        if "replay_search" in group:
-            await self._action_replay_search(
-                target, group["replay_search"], vars_dict,
+        # 4. Replay (if requested) — runs after all param actions
+        if group.get("replay", False):
+            try:
+                await self._action_replay(target)
+            except Exception:
+                ctx.master.addons.trigger(hooks.UpdateHook([target]))
+                return  # Abort on replay failure
+
+            ctx.master.addons.trigger(hooks.UpdateHook([target]))
+
+        # 5. Search (runs after replay, only searches — no replay)
+        if "search" in group:
+            self._action_search(target, group["search"], vars_dict)
+            ctx.master.addons.trigger(hooks.UpdateHook([target]))
+
+        # 6. find_important_headers_cookies (terminal, does its own replays)
+        if "find_important_headers_cookies" in group:
+            await self._action_find_important_headers_cookies(
+                target, group["find_important_headers_cookies"], vars_dict,
             )
+            ctx.master.addons.trigger(hooks.UpdateHook([target]))
 
     # ------------------------------------------------------------------
     # Core: process all flows × all action-groups
@@ -473,7 +698,7 @@ class FlowActions:
         return config
 
     # ------------------------------------------------------------------
-    # mitmproxy command
+    # mitmproxy command: flow.actions (manual, flow-based)
     # ------------------------------------------------------------------
     @command.command("flow.actions")
     @command.argument("flows", type=Sequence[flow.Flow])
@@ -526,6 +751,104 @@ class FlowActions:
             ALERT,
             "[flow.actions] Pipeline initiated. "
             "Results will appear as actions complete.",
+        )
+
+    # ------------------------------------------------------------------
+    # mitmproxy command: flow.actions.watch (auto-apply on incoming flows)
+    # ------------------------------------------------------------------
+    @command.command("flow.actions.watch")
+    @command.argument("filter_expr", type=str)
+    @command.argument("yaml_path", type=types.Path)
+    def flow_actions_watch_command(
+        self,
+        filter_expr: str,
+        yaml_path: types.Path,
+    ) -> None:
+        """
+        Watch incoming flows matching filter and auto-apply YAML rules.
+
+        Usage:
+            flow.actions.watch "~u example.com" ./rules.yaml
+            flow.actions.watch "~m POST & ~u /api" ./rules.yaml
+        """
+        config = self._load_config(str(yaml_path))
+        if config is None:
+            return
+
+        # Validate the filter expression
+        from mitmproxy import flowfilter
+        compiled = flowfilter.parse(filter_expr)
+        if compiled is None:
+            logging.log(
+                ALERT,
+                f"[flow.actions.watch] Invalid filter expression: {filter_expr}",
+            )
+            return
+
+        self._watch_filter = filter_expr
+        self._watch_config = config
+        self._watch_active = True
+
+        rule_name = config.get("name", "<unnamed>")
+        logging.log(
+            ALERT,
+            f"[flow.actions.watch] ▶ Watching — filter='{filter_expr}', "
+            f"rule='{rule_name}'. Use flow.actions.stop to disable.",
+        )
+
+    @command.command("flow.actions.stop")
+    def flow_actions_stop_command(self) -> None:
+        """
+        Stop watching for incoming flows.
+
+        Usage:
+            flow.actions.stop
+        """
+        if not self._watch_active:
+            logging.log(ALERT, "[flow.actions.stop] No active watch to stop.")
+            return
+
+        old_filter = self._watch_filter
+        self._watch_filter = None
+        self._watch_config = None
+        self._watch_active = False
+
+        logging.log(
+            ALERT,
+            f"[flow.actions.stop] ■ Stopped watching (was: '{old_filter}').",
+        )
+
+    # ------------------------------------------------------------------
+    # Hook: request — auto-apply rules on matching incoming flows
+    # ------------------------------------------------------------------
+    def request(self, flow_obj: http.HTTPFlow) -> None:
+        """
+        mitmproxy hook: called for every incoming request.
+        If watch is active and the flow matches the filter, apply the rules.
+        """
+        if not self._watch_active or self._watch_config is None:
+            return
+
+        # Skip replayed flows to avoid infinite loops
+        if flow_obj.is_replay:
+            return
+
+        from mitmproxy import flowfilter
+        compiled = flowfilter.parse(self._watch_filter)
+        if compiled is None:
+            return
+
+        if not compiled(flow_obj):
+            return
+
+        rule_name = self._watch_config.get("name", "<unnamed>")
+        logging.info(
+            f"[flow.actions.watch] Auto-applying rule '{rule_name}' "
+            f"to flow {flow_obj.id} ({flow_obj.request.pretty_url})"
+        )
+
+        asyncio.ensure_future(
+            self._run_all([flow_obj], self._watch_config)
         )
 
 
