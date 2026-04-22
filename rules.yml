@@ -35,9 +35,11 @@ vars:
 #   2. duplicate (copy flow if true)
 #   3. replace_params (modify existing params)
 #   4. add_params (inject new params)
-#   5. replay (replay the request)           — after all param actions
-#   6. search (search the response)          — after replay
-#   7. find_important_headers_cookies        — terminal (does its own replays)
+#   5. remove_headers_cookies (remove headers/cookies)
+#   6. set_headers_cookies (set/overwrite headers/cookies)
+#   7. replay (replay the request)           — after all modifications
+#   8. search (search the response)          — after replay
+#   9. find_important_headers_cookies        — terminal (does its own replays)
 # ----------------------------------------------------------
 action-groups:
 
@@ -94,7 +96,27 @@ action-groups:
   #     scope: "both"                     # "headers" | "cookies" | "both"
   #     output: "./important_results.json" # optional, logs if omitted
 
-  # --- Group 3: In-place modification (no duplicate) -------
+  # --- Group 3: Remove headers & cookies -------------------
+  # - remove_headers_cookies:
+  #     headers:
+  #       - "X-Custom-Header"
+  #       - "Authorization"
+  #     cookies:
+  #       - "tracking"
+  #       - "analytics_id"
+  #   replay: true
+
+  # --- Group 4: Set headers & cookies -----------------------
+  # - set_headers_cookies:
+  #     headers:
+  #       X-Custom-Header: "injected-value"
+  #       Authorization: "Bearer fake-token"
+  #     cookies:
+  #       session_id: "abc123"
+  #       role: "admin"
+  #   replay: true
+
+  # --- Group 5: In-place modification (no duplicate) -------
   # - duplicate: false
   #   replace_params:
   #     auth_token: "expired_jwt"
