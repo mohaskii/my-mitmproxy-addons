@@ -1,0 +1,8 @@
+action-groups:
+  - remove_headers_cookies:
+      headers: ["x-.*"]
+      cookies: [".*"]
+      # except_headers: ["x-kpsdk-ct"]
+      # except_cookies: ["__Secure-access-token"] #the only needed token 
+    duplicate: true
+    replay: true
