@@ -22,11 +22,14 @@ to flows. It is structured into a modular `flow_actions_lib`:
 4. **add_params** — inject new key-value pairs
 5. **remove_headers_cookies** — remove specific headers/cookies
 6. **set_headers_cookies** — set/overwrite headers/cookies
-7. **replay** — `replay: true` replays the request (standalone, no search)
-8. **search** — search response body/headers for values (post-replay,
-   search-only)
-9. **find_important_headers_cookies** — terminal action, probes each
-   header/cookie individually
+7. **body** — modify the request body entirely (`value`) or selectively via
+   nested accessors (`json-set`)
+8. **kill** — `kill: true` terminates and drops the flow entirely
+9. **replay** — `replay: true` replays the request (standalone, no search)
+10. **search** — search response body/headers for values (post-replay,
+    search-only)
+11. **find_important_headers_cookies** — terminal action, probes each
+    header/cookie individually
 
 ### Commands
 
@@ -60,6 +63,11 @@ action-groups:
         Authorization: { var: auth }
       cookies:
         role: "admin"
+    body:
+      value: '{"simple": "override"}'
+      json-set:
+        - "nested.field": { var: key }
+    kill: true
     replay: true
     search:
       value: { var: key }
@@ -74,6 +82,12 @@ action-groups:
 ### Key patterns
 
 - **Variable resolution**: `{ var: name }` or `{ var: [a, b] }` or `"literal"`
+- **`body`** provides two sub-actions: `value` completely overwrites the
+  payload, whereas `json-set` specifically operates upon the parsed JSON,
+  recursively traversing dot notation (e.g., `user.profile.name`) to overwrite
+  parameters without modifying surrounding data.
+- **`kill`** is a boolean flag indicating if the flow should be forcefully
+  dropped by the interceptor.
 - **`replay`** is a boolean flag — `true` to replay after all modifications
 - **`search`** only searches (no replay). Requires `replay: true` before it
 - **`remove_headers_cookies`** takes `headers` (list) and `cookies` (list).
@@ -98,3 +112,19 @@ action-groups:
 4. If async/terminal: handle explicitly in `_apply_action_group()` in
    `flow_actions.py` after the ordered actions.
 5. Update the YAML schema docstring and this workflow.
+
+### Best Practices & Pitfalls
+
+- **Type Narrowing**: When relying on optional instance variables (e.g.,
+  `self._watch_filter: str | None`), always explicitly narrow their types
+  locally in condition blocks (e.g., `if not self._watch_filter: return`)
+  instead of depending solely on related state variables like
+  `self._watch_active`. This allows static analysis engines (like Pyright/Mypy)
+  to correctly deduce non-None types.
+- **Header Deletion**: Working with mitmproxy's 10+ internal `Headers` multidict
+  requires care. Because traversing `Headers.keys()` could yield duplicate keys
+  (if a header occurs multiple times like `Set-Cookie` or `X-Forwarded-For`),
+  doing consecutive `del target.request.headers[name]` will falsely trigger a
+  `KeyError: b'header_name'`. Instead, match the iterated keys and deposit them
+  into a Python `set()`, looping over the set later to delete the
+  identically-named headers all at once cleanly.

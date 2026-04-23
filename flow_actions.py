@@ -26,6 +26,8 @@ from flow_actions_lib.actions import (
     action_search,
     action_find_important_headers_cookies,
     duplicate_flow,
+    action_body,
+    action_kill,
 )
 
 ORDERED_ACTIONS = [
@@ -33,6 +35,8 @@ ORDERED_ACTIONS = [
     "add_params",
     "remove_headers_cookies",
     "set_headers_cookies",
+    "body",
+    "kill",
 ]
 
 FAIL_MARKER = ":x:"
@@ -64,6 +68,8 @@ class FlowActions:
             "add_params": action_add_params,
             "remove_headers_cookies": action_remove_headers_cookies,
             "set_headers_cookies": action_set_headers_cookies,
+            "body": action_body,
+            "kill": action_kill,
         }
         return registry.get(action_name)
 
